@@ -1,4 +1,3 @@
-# app.py
 import os
 import requests
 from flask import Flask, request
@@ -20,10 +19,10 @@ OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY")
 if not OPENMETER_API_KEY:
     raise RuntimeError("Missing OPENMETER_API_KEY")
 
-OPENMETER_BASE_URL = "https://openmeter.cloud/api/v1"   # Cloud base URL
-FALLBACK_TO = "aalguraini@dscan.ai"                     # safety net
+OPENMETER_BASE_URL = "https://openmeter.cloud/api/v1"     # Cloud base URL
+FALLBACK_TO = "aalguraini@dscan.ai"                       # safety net
 
-# HTTP defaults
+# HTTP
 HTTP_TIMEOUT = 10
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -96,6 +95,91 @@ def send_resend_email(to_addr: str, subject: str, body_text: str) -> None:
         "text": body_text,
     })
 
+# ---------- Email content builders ----------
+
+def _fmt(n):
+    try:
+        n = float(n)
+        if n.is_integer():
+            return f"{int(n):,}"
+        return f"{n:,.2f}"
+    except Exception:
+        return str(n)
+
+def _as_int_percent(v):
+    """Turn 100, '100', '100%', ' 100 % ' → 100; return None if unknown."""
+    try:
+        s = str(v).strip().replace("%", "")
+        return int(float(s))
+    except Exception:
+        return None
+
+def build_threshold_email(payload: dict) -> tuple[str, str]:
+    """
+    Build (subject, body) for any entitlements.balance.threshold.
+    - Robust percent parsing
+    - If balance==0 or hasAccess==false -> treat as 100%
+    - Custom text for 75/90/100, sensible default otherwise
+    """
+    d = payload["data"]
+    feature = d["feature"]["name"]
+
+    th       = d.get("threshold", {}) or {}
+    th_type  = th.get("type", "PERCENT")
+    th_value = th.get("value")
+
+    values     = d.get("value", {}) or {}
+    used       = values.get("usage")
+    balance    = values.get("balance")
+    has_access = values.get("hasAccess")
+
+    # Parse percent cleanly
+    pct = _as_int_percent(th_value) if th_type == "PERCENT" else None
+
+    # Treat out-of-balance as 100%
+    exhausted = (has_access is False) or (balance == 0)
+    if exhausted:
+        pct = 100
+
+    # Subject line
+    if pct == 75:
+        subject = f"🔔 You’ve used 75% of your {feature}"
+    elif pct == 90:
+        subject = f"⏰ You’ve used 90% of your {feature}"
+    elif pct == 100:
+        subject = f"⛔ You’ve used 100% of your {feature} (no balance left)"
+    else:
+        subject = (
+            f"ℹ️ You’ve reached {th_value}% of your {feature}"
+            if th_type == "PERCENT" and th_value is not None
+            else f"ℹ️ {feature} threshold reached"
+        )
+
+    # Body
+    parts = ["Hello,", ""]
+    if pct is not None:
+        parts.append(f"You’ve now used {pct}% of your {feature} quota.")
+    else:
+        parts.append(f"You’ve reached the configured {feature} threshold.")
+
+    extras = []
+    if used is not None:
+        extras.append(f"Used: {_fmt(used)}")
+    if balance is not None:
+        extras.append(f"Remaining: {_fmt(balance)}")
+    if extras:
+        parts.append(" • " + " | ".join(extras))
+
+    if pct == 100 or exhausted:
+        parts += ["", "Your balance is depleted. Upgrade or top up to continue."]
+    elif pct is not None and pct >= 90:
+        parts += ["", "You’re almost out. Consider upgrading your plan so there’s no interruption."]
+    else:
+        parts += ["", "Heads up! You’re getting close. Upgrade any time if you need more."]
+
+    parts += ["", "– The Nabrah Team"]
+    return subject, "\n".join(parts)
+
 # ── Webhook ────────────────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def handle_openmeter():
@@ -120,25 +204,13 @@ def handle_openmeter():
             print("❌ Test email failed:", e, flush=True)
         return "", 200
 
-    # Threshold alerts
+    # Threshold alerts (all rules)
     if etype == "entitlements.balance.threshold":
         try:
-            feature   = payload["data"]["feature"]["name"]
-            threshold = payload["data"]["threshold"]["value"]
-            to_addr   = resolve_recipient_email(payload)
-
-            print(f"👉 Threshold event: feature={feature}, value={threshold}, to={to_addr}", flush=True)
-
-            send_resend_email(
-                to_addr,
-                f"⏰ You’ve used {threshold}% of your {feature}",
-                (
-                    f"Hello,\n\n"
-                    f"You’ve now used {threshold}% of your {feature} quota.\n"
-                    "Consider upgrading for more minutes.\n\n"
-                    "– The Nabrah Team"
-                ),
-            )
+            to_addr = resolve_recipient_email(payload)
+            subject, body = build_threshold_email(payload)
+            print(f"👉 Threshold email → to={to_addr} | subject={subject}", flush=True)
+            send_resend_email(to_addr, subject, body)
             print(f"✅ Alert email sent to {to_addr}", flush=True)
         except Exception as e:
             print("❌ Failed inside threshold handler:", e, flush=True)
