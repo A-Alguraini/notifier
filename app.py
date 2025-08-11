@@ -1,106 +1,160 @@
 import os
-import requests
+import sys
+import json
+from typing import Optional
+
 from flask import Flask, request, jsonify
+import requests
+import resend
+from dotenv import load_dotenv
+
+# ─── Setup ────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY")
+# Use the REST API endpoint shown in OpenMeter > Integrations > API (same workspace!)
+OPENMETER_BASE_URL = os.getenv("OPENMETER_BASE_URL", "https://openmeter.cloud")
+
+if not RESEND_API_KEY:
+    raise RuntimeError("Missing RESEND_API_KEY")
+if not OPENMETER_API_KEY:
+    print("ERROR: Missing OPENMETER_API_KEY (set it in Render env).", flush=True)
+    # don't raise; we still want to boot to see 200s to Svix tests, but lookups will fail
+
+resend.api_key = RESEND_API_KEY
+
+FROM_EMAIL = "Nabrah <no-reply@nabrah.ai>"
+FALLBACK_TO = os.getenv("FALLBACK_TO", "aalguraini@dscan.ai")
 
 app = Flask(__name__)
 
-OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY")
-OPENMETER_BASE_URL = "https://api.openmeter.io/v1"
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-FALLBACK_EMAIL = "your-fallback@example.com"
-
-# --- Helpers ---
-def get_customer_email_from_openmeter(subject_key):
-    headers = {"Authorization": f"Bearer {OPENMETER_API_KEY}"}
-
-    # Try direct customer lookup
-    resp = requests.get(f"{OPENMETER_BASE_URL}/customers/{subject_key}", headers=headers)
-    if resp.status_code == 200:
-        email = resp.json().get("primaryEmail")
-        if email:
-            return email
-
-    # Try filtering by subjectKey
-    resp = requests.get(f"{OPENMETER_BASE_URL}/customers", params={"subjectKey": subject_key}, headers=headers)
-    if resp.status_code == 200:
-        customers = resp.json().get("data", [])
-        if customers and customers[0].get("primaryEmail"):
-            return customers[0]["primaryEmail"]
-
-    return None
-
-
-def build_threshold_subject_and_text(feature_name, t_value):
-    if t_value == 50:
-        subject = f"🟢 50% of your {feature_name} quota used"
-    elif t_value == 75:
-        subject = f"🟡 75% of your {feature_name} quota used"
-    elif t_value == 90:
-        subject = f"🟠 90% of your {feature_name} quota used"
-    elif t_value == 100:
-        subject = f"🔴 100% of your {feature_name} quota used"
-    else:
-        subject = f"You’ve reached {t_value}% of your {feature_name} quota"
-
-    text = (
-        f"Hello,\n\n"
-        f"You have now used {t_value}% of your {feature_name} quota.\n"
-        f"Consider upgrading for more capacity.\n\n"
-        f"- The Nabrah Team"
-    )
-
-    html = (
-        f"<p>Hello,</p>"
-        f"<p>You have now used <b>{t_value}%</b> of your <b>{feature_name}</b> quota.</p>"
-        f"<p>Consider upgrading for more capacity.</p>"
-        f"<p>- The Nabrah Team</p>"
-    )
-
-    return subject, text, html
-
-
-def send_email_via_resend(to_email, subject, text, html):
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def om_get(path: str, params: dict) -> requests.Response:
+    """GET to OpenMeter REST API with auth; logs URL and status."""
+    url = f"{OPENMETER_BASE_URL.rstrip('/')}{path}"
     headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json"
+        "Accept": "application/json",
+        "Authorization": f"Bearer {OPENMETER_API_KEY}" if OPENMETER_API_KEY else "",
     }
-    payload = {
-        "from": "Nabrah <no-reply@nabrah.ai>",
-        "to": [to_email],
-        "subject": subject,
-        "text": text,
-        "html": html
-    }
-    resp = requests.post("https://api.resend.com/emails", headers=headers, json=payload)
-    resp.raise_for_status()
+    print(f"🌐 OpenMeter GET {url} params={params}", flush=True)
+    resp = requests.get(url, headers=headers, params=params, timeout=10)
+    print(f"🌐 → {resp.status_code}", flush=True)
+    return resp
 
+def extract_email_from_customer(cust: dict) -> Optional[str]:
+    # Prefer primaryEmail
+    email = cust.get("primaryEmail")
+    if email:
+        return email
+    # Try metadata.email
+    meta = cust.get("metadata") or {}
+    return meta.get("email")
 
-# --- Webhook endpoint ---
-@app.route("/webhook", methods=["POST"])
-def webhook_handler():
-    data = request.json
-    print(f"📩 Received webhook: {data}")
+def lookup_email_for_subject(subject_key: str) -> Optional[str]:
+    """Find customer email via subject.key -> customer -> email."""
+    if not OPENMETER_API_KEY:
+        print("⚠️ No OPENMETER_API_KEY set. Skipping lookup.", flush=True)
+        return None
 
-    if data.get("type") != "entitlements.balance.threshold":
-        return jsonify({"status": "ignored"})
+    try:
+        # Prefer direct lookup by subjectKey if supported
+        # (Many deployments support ?subjectKey=... on /customers)
+        resp = om_get("/customers", {"subjectKey": subject_key})
+        if resp.status_code == 401:
+            print("❌ OpenMeter auth failed (401). Wrong or missing API key.", flush=True)
+            return None
+        if resp.status_code == 404:
+            print("❌ OpenMeter returned 404. Likely wrong workspace/org for this API key.", flush=True)
+            return None
+        resp.raise_for_status()
 
-    subject_key = data["subject"]["key"]
-    feature_name = data.get("feature", {}).get("displayName") or data.get("feature", {}).get("name", "Unknown Feature")
-    t_value = data.get("threshold", {}).get("value", "Unknown")
+        data = resp.json()
+        customers = data if isinstance(data, list) else data.get("data", [])
+        if not customers:
+            print("ℹ️ No customer found for this subject.key.", flush=True)
+            return None
 
-    # Look up email from OpenMeter
-    email = get_customer_email_from_openmeter(subject_key)
-    if not email:
-        print(f"⚠️ No customer email found for subject_key={subject_key}, using fallback.")
-        email = FALLBACK_EMAIL
+        # Use the first match
+        cust = customers[0]
+        print(f"🧭 Found customer: {cust.get('name') or cust.get('key')}", flush=True)
+        email = extract_email_from_customer(cust)
+        if email:
+            print(f"📧 Resolved recipient email: {email}", flush=True)
+            return email
+        print("ℹ️ Customer has no primaryEmail/metadata.email.", flush=True)
+        return None
 
-    subject, text, html = build_threshold_subject_and_text(feature_name, t_value)
+    except requests.RequestException as e:
+        print(f"❌ OpenMeter request error: {e}", flush=True)
+        return None
+    except Exception as e:
+        print(f"❌ Unexpected lookup error: {e}", flush=True)
+        return None
 
-    # Send email
-    send_email_via_resend(email, subject, text, html)
-    print(f"✅ Alert email sent to {email}")
-    return jsonify({"status": "ok"})
+def send_email(to_addr: str, subject: str, text: str):
+    """Send email via Resend; logs outcome."""
+    try:
+        resend.Emails.send({"from": FROM_EMAIL, "to": [to_addr], "subject": subject, "text": text})
+        print(f"✅ Email sent → {to_addr} | subject='{subject}'", flush=True)
+    except Exception as e:
+        print(f"❌ Resend send failed: {e}", flush=True)
 
+# ─── Webhook ──────────────────────────────────────────────────────────────────
+@app.route("/", methods=["POST"])
+def handle_openmeter():
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception:
+        print("❌ Could not parse JSON body.", flush=True)
+        return jsonify({"ok": False}), 400
+
+    print("🔔 Received webhook:", json.dumps(payload, indent=2), flush=True)
+
+    event_type = payload.get("type")
+    if event_type != "entitlements.balance.threshold":
+        print(f"⚪ Ignored event type: {event_type}", flush=True)
+        return "", 200
+
+    data = payload.get("data", {})
+    feature = (data.get("feature") or {}).get("name")
+    meter   = (data.get("meterSlug"))
+    subject = (data.get("subject") or {})
+    subject_key = subject.get("key")
+    threshold_obj = data.get("threshold") or {}
+    threshold_val = threshold_obj.get("value")
+    threshold_type = threshold_obj.get("type")  # usually 'PERCENT'
+
+    # Log what fired
+    print(f"📌 Threshold fired: feature='{feature}', meter='{meter}', "
+          f"threshold={threshold_val}{('%' if threshold_type=='PERCENT' else '')}, "
+          f"subject.key='{subject_key}'", flush=True)
+
+    # Who should get the email?
+    to_addr = lookup_email_for_subject(subject_key) or FALLBACK_TO
+    if to_addr == FALLBACK_TO:
+        print("🟡 Using fallback email (no customer email found for this subject).", flush=True)
+
+    # Compose message for any percentage
+    subj = f"ℹ️ You’ve reached {threshold_val}% of your {meter or feature} quota"
+    text = (
+        "Hello,\n\n"
+        f"You’ve now reached {threshold_val}% of your {meter or feature} quota "
+        "based on your current entitlement balance.\n\n"
+        "Consider upgrading if you expect more usage.\n\n"
+        "– The Nabrah Team"
+    )
+
+    # Send it
+    print(f"✉️  Sending -> {to_addr}", flush=True)
+    send_email(to_addr, subj, text)
+    return "", 200
+
+# ─── Health check (optional) ───────────────────────────────────────────────────
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    # Local runs
+    app.run(host="0.0.0.0", port=5000)
