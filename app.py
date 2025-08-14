@@ -1,167 +1,116 @@
-import os
-import math
-import requests
+# app.py (only the changes below matter)
+
+import os, sys, requests
 from flask import Flask, request
-from dotenv import load_dotenv
 import resend
+from dotenv import load_dotenv
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
 load_dotenv()
-resend.api_key       = os.environ["RESEND_API_KEY"]
-OPENMETER_API_KEY    = os.environ.get("OPENMETER_API_KEY")
-OPENMETER_BASE       = os.environ.get("OPENMETER_BASE", "https://openmeter.cloud")
-FALLBACK_TO          = os.environ.get("FALLBACK_TO", "aalguraini@dscan.ai")
+resend.api_key = os.getenv("RESEND_API_KEY")
+OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY")
+OPENMETER_BASE = os.getenv("OPENMETER_BASE", "https://openmeter.cloud/api/v1")
 
-SESSION = requests.Session()
-if OPENMETER_API_KEY:
-    SESSION.headers.update({
-        "Authorization": f"Bearer {OPENMETER_API_KEY}",
-        "Accept": "application/json",
-    })
+FALLBACK_EMAIL = "aalguraini@dscan.ai"   # your current fallback
 
 app = Flask(__name__)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+def _om_headers():
+    return {
+        "Authorization": f"Bearer {OPENMETER_API_KEY}",
+        "Accept": "application/json",
+    }
 
-def extract_subject_key(payload: dict) -> str | None:
+def get_customer_from_openmeter(subject_key: str):
     """
-    Prefer a real *subject key*.
-    We DO NOT use 'subject.id' because that's not a customer key.
+    Resolve a customer from a subject_key.
+    1) Try `/customers/{customer_key}` where customer_key is subject_key with hyphens removed.
+    2) If 404, try `/customers?subjectKey={subject_key}` and use the first hit.
+    Return (customer_dict or None).
     """
-    d = payload.get("data", {}) or {}
-    # 1) top-level subjectKey if present
-    if isinstance(d.get("subjectKey"), str) and d["subjectKey"]:
-        return d["subjectKey"]
-    # 2) nested subject.key
-    subj = d.get("subject") or {}
-    key = subj.get("key")
-    if isinstance(key, str) and key:
-        return key
+    # 1) direct by key (hyphens removed)
+    customer_key = subject_key.replace("-", "")
+    url = f"{OPENMETER_BASE}/customers/{customer_key}"
+    r = requests.get(url, headers=_om_headers(), timeout=10)
+    print(f"🔎 OpenMeter GET {url} -> {r.status_code}", flush=True)
+
+    if r.status_code == 200:
+        return r.json()
+
+    if r.status_code != 404:
+        print(f"⚠️ Unexpected status {r.status_code}: {r.text}", flush=True)
+
+    # 2) fallback: query by subjectKey (some orgs allow this)
+    url2 = f"{OPENMETER_BASE}/customers"
+    r2 = requests.get(url2, headers=_om_headers(), params={"subjectKey": subject_key}, timeout=10)
+    print(f"🔎 OpenMeter GET {url2}?subjectKey={subject_key} -> {r2.status_code}", flush=True)
+    if r2.status_code == 200:
+        body = r2.json()
+        # API returns either a single object or a list; handle both
+        if isinstance(body, dict) and body.get("key"):
+            return body
+        if isinstance(body, list) and body:
+            return body[0]
+
     return None
 
-def openmeter_get_customer_by_key(customer_key: str) -> dict | None:
+def send_email(to_addr: str, subject: str, text: str):
     try:
-        url = f"{OPENMETER_BASE}/api/v1/customers/{customer_key}"
-        r = SESSION.get(url, timeout=10)
-        print(f"🔎 OpenMeter GET {url} -> {r.status_code}")
-        if r.status_code == 200:
-            return r.json()
-        else:
-            print("⚠️ OpenMeter lookup failed:", r.status_code, r.text)
+        resend.Emails.send({
+            "from": "Nabrah <no-reply@nabrah.ai>",
+            "to": [to_addr],
+            "subject": subject,
+            "text": text,
+        })
+        print(f"✅ Alert email sent to {to_addr} | subject=“{subject}”", flush=True)
     except Exception as e:
-        print("❌ OpenMeter request error:", e)
-    return None
-
-def pick_recipient_email(customer: dict) -> str:
-    # prefer metadata.email if present
-    meta = (customer or {}).get("metadata") or {}
-    meta_email = meta.get("email")
-    if isinstance(meta_email, str) and meta_email.strip():
-        return meta_email.strip()
-
-    # fallback to primaryEmail
-    prim = (customer or {}).get("primaryEmail")
-    if isinstance(prim, str) and prim.strip():
-        return prim.strip()
-
-    # final fallback
-    return FALLBACK_TO
-
-def pick_project_name(customer: dict, payload: dict) -> str:
-    # customer.name if we have the customer
-    name = (customer or {}).get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-
-    # nested subject.displayName from the event
-    subj = (payload.get("data") or {}).get("subject") or {}
-    disp = subj.get("displayName")
-    if isinstance(disp, str) and disp.strip():
-        return disp.strip()
-
-    return "Your Project"
-
-def minutes_left_from_payload(payload: dict) -> float | None:
-    # OpenMeter sends balance under data.value.balance
-    try:
-        v = ((payload.get("data") or {}).get("value") or {}).get("balance")
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-def threshold_percent(payload: dict) -> str:
-    try:
-        val = ((payload.get("data") or {}).get("threshold") or {}).get("value")
-        if val is None:
-            return "?"
-        # make it pretty (no .0 unless needed)
-        if float(val).is_integer():
-            return f"{int(val)}%"
-        return f"{val}%"
-    except Exception:
-        return "?"
-
-# ── Webhook ────────────────────────────────────────────────────────────────────
+        print("❌ Failed to send email:", e, flush=True)
 
 @app.route("/", methods=["POST"])
-def handle_openmeter():
-    payload = request.get_json(force=True)
-    print("📬 Received webhook")
-    # Only alerts
-    if payload.get("type") != "entitlements.balance.threshold":
-        print("ℹ️ Ignored event type:", payload.get("type"))
+def webhook():
+    data = request.get_json(force=True)
+    print("📥 Received webhook:", data, flush=True)
+
+    if data.get("type") != "entitlements.balance.threshold":
+        print("ℹ️ Ignored event type:", data.get("type"), flush=True)
         return "", 200
 
-    # Parse
-    s_key = extract_subject_key(payload)
-    feature = ((payload.get("data") or {}).get("feature") or {}).get("name") or "Call Minutes"
-    meter   = ((payload.get("data") or {}).get("meterSlug")) or "Unknown meter"
-    tstr    = threshold_percent(payload)
-    mins    = minutes_left_from_payload(payload)
+    # Extract details
+    subj = data["data"]["subject"]
+    subject_key = subj.get("key") or subj.get("id")
+    feature = data["data"]["feature"]["name"]
+    threshold = data["data"]["threshold"]["value"]
+    value = data["data"]["value"]         # this contains balance/usage/overage
+    balance = float(value.get("balance", 0.0))
 
-    print(f"🧩 Parsed -> subject_key={s_key}, feature={feature}, meter={meter}, threshold={tstr}")
+    print(f"🧩 Parsed -> subject_key={subject_key}, feature={feature}, threshold={threshold}%", flush=True)
 
-    customer = None
-    if s_key:
-        customer = openmeter_get_customer_by_key(s_key)
+    # Resolve customer
+    customer = get_customer_from_openmeter(subject_key) if subject_key else None
 
-    # Recipient + project name
-    to_email = pick_recipient_email(customer)
-    project  = pick_project_name(customer, payload)
-    mins_str = f"{mins:.2f} min left" if mins is not None else "minutes left: n/a"
+    # Recipient and project name
+    to_addr = FALLBACK_EMAIL
+    project_name = "Your Project"
 
-    # Build email
-    subj = f"Your Project: You’ve reached {tstr} of your {feature} quota — {mins_str}"
+    if customer:
+        # prefer primaryEmail; fallback to metadata.email
+        to_addr = customer.get("primaryEmail") or (customer.get("metadata") or {}).get("email") or FALLBACK_EMAIL
+        # prefer customer name; fallback to subject displayName
+        project_name = customer.get("name") or (subj.get("displayName") or "Your Project")
+        print(f"📧 Resolved customer: name='{project_name}', email='{to_addr}'", flush=True)
+    else:
+        print("⚠️ No customer found (using fallback email & generic project name)", flush=True)
+
+    subject = f"📈 {project_name}: You’ve reached {threshold}% of your Call Minutes quota — {balance:.2f} min left"
     body = (
         f"Hello,\n\n"
-        f"Project: {project}\n"
-        f"Call Minutes left: {mins:.2f} min\n" if mins is not None else
-        f"Hello,\n\nProject: {project}\n"
-    )
-    body += (
-        f"\nYou’ve reached {tstr} of your {feature} quota for this project.\n"
+        f"Project: {project_name}\n"
+        f"Call Minutes left: {balance:.2f} min\n\n"
+        f"You’ve reached {threshold}% of your Call Minutes quota for this project.\n"
         f"Consider upgrading for more capacity.\n\n"
         f"— The Nabrah Team"
     )
-
-    params = {
-        "from":    "Nabrah <no-reply@nabrah.ai>",
-        "to":      [to_email],
-        "subject": subj,
-        "text":    body,
-    }
-
-    try:
-        resend.Emails.send(params)
-        print(f"✅ Alert email sent to {to_email} | subject=“{subj}”")
-    except Exception as e:
-        print("❌ Failed to send email:", e)
-
+    send_email(to_addr, subject, body)
     return "", 200
 
 
-if __name__ == "__main__":
-    # Render/Heroku style: gunicorn in prod. Local: flask dev server.
-    app.run(host="0.0.0.0", port=5000)
+# gunicorn entrypoint expects `app` variable
