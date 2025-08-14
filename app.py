@@ -5,160 +5,136 @@ from flask import Flask, request
 import resend
 from dotenv import load_dotenv
 
-# ─── Config ────────────────────────────────────────────────────────────────────
+# ─── Setup ─────────────────────────────────────────────────────────────────────
 load_dotenv()
 
+# Resend
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 if not RESEND_API_KEY:
     raise RuntimeError("Missing RESEND_API_KEY")
-
-OPENMETER_API_KEY = os.getenv("OPENMETER_API_KEY")
-if not OPENMETER_API_KEY:
-    raise RuntimeError("Missing OPENMETER_API_KEY")
-
-OPENMETER_API_URL = os.getenv("OPENMETER_API_URL", "https://openmeter.cloud/api/v1")
-FALLBACK_TO = os.getenv("FALLBACK_TO", "aalguraini@dscan.ai")
-BASE_FROM = "Nabrah <no-reply@nabrah.ai>"
-
 resend.api_key = RESEND_API_KEY
 
-HTTP_HEADERS = {
-    "Authorization": f"Bearer {OPENMETER_API_KEY}",
-    "Content-Type": "application/json",
-}
+FROM_EMAIL = os.getenv("FROM_EMAIL", "Nabrah <no-reply@nabrah.ai>")
+FALLBACK_EMAIL = os.getenv("FALLBACK_EMAIL", "aalguraini@dscan.ai")  # keep your own default
+
+# OpenMeter
+OM_API_KEY = os.getenv("OPENMETER_API_KEY")
+if not OM_API_KEY:
+    raise RuntimeError("Missing OPENMETER_API_KEY")
+OM_BASE = os.getenv("OPENMETER_BASE", "https://openmeter.cloud")
 
 app = Flask(__name__)
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
-def dashless(s: str) -> str:
-    return s.replace("-", "") if s else s
-
-def _get(url: str, **kwargs) -> requests.Response:
-    return requests.get(url, headers=HTTP_HEADERS, timeout=10, **kwargs)
-
-def find_customer_email(subject_key: str) -> str | None:
+def get_customer_email_from_subject(subject_key: str) -> str | None:
     """
-    Resolve the recipient email.
-    Strategy:
-      1) /customers?subjectKey=<subject_key>
-      2) /customers/<dashless(subject_key)>
-      3) /customers?key=<dashless(subject_key)>
-      4) None -> caller will use fallback
+    subject_key looks like: '01989852-e5b1-7b7d-aac4-cf09fd93fade'
+    customer_key is the same but without dashes.
     """
     if not subject_key:
-        print("⚠️ No subject_key provided to find_customer_email", flush=True)
         return None
 
-    # 1) Directly by subjectKey (best if relationship is set in OpenMeter)
-    try:
-        url = f"{OPENMETER_API_URL}/customers"
-        r = _get(url, params={"subjectKey": subject_key})
-        print(f"🔎 GET {url}?subjectKey={subject_key} -> {r.status_code}", flush=True)
-        if r.status_code == 200:
-            items = (r.json() or {}).get("items", [])
-            if items:
-                cust = items[0]
-                email = cust.get("primaryEmail") or (cust.get("metadata") or {}).get("email")
-                if email:
-                    print(f"✅ email={email} via subjectKey", flush=True)
-                    return email
-    except Exception as e:
-        print(f"⚠️ subjectKey lookup error: {e}", flush=True)
+    customer_key = subject_key.replace("-", "")
+    url = f"{OM_BASE}/api/v1/customers/{customer_key}"
+    headers = {
+        "Authorization": f"Bearer {OM_API_KEY}",
+        "Accept": "application/json",
+    }
 
-    # 2) By customer key (dashless subject_key)
-    dk = dashless(subject_key)
     try:
-        url = f"{OPENMETER_API_URL}/customers/{dk}"
-        r = _get(url)
-        print(f"🔎 GET {url} -> {r.status_code}", flush=True)
+        r = requests.get(url, headers=headers, timeout=10)
+        print(f"🔎 OpenMeter GET {url} -> {r.status_code}", flush=True)
         if r.status_code == 200:
-            cust = r.json() or {}
-            email = cust.get("primaryEmail") or (cust.get("metadata") or {}).get("email")
-            if email:
-                print(f"✅ email={email} via /customers/{{key}}", flush=True)
-                return email
+            j = r.json()
+            # Prefer primaryEmail, then metadata.email
+            email = j.get("primaryEmail")
+            if not email:
+                meta = j.get("metadata") or {}
+                email = meta.get("email")
+            return email
+        elif r.status_code == 404:
+            print("ℹ️ No customer found for this subject (404).", flush=True)
+        else:
+            print(f"⚠️ OpenMeter error: {r.status_code} {r.text}", flush=True)
     except Exception as e:
-        print(f"⚠️ /customers/{{key}} lookup error: {e}", flush=True)
-
-    # 3) By ?key=<dashless(subject_key)>
-    try:
-        url = f"{OPENMETER_API_URL}/customers"
-        r = _get(url, params={"key": dk})
-        print(f"🔎 GET {url}?key={dk} -> {r.status_code}", flush=True)
-        if r.status_code == 200:
-            items = (r.json() or {}).get("items", [])
-            if items:
-                cust = items[0]
-                email = cust.get("primaryEmail") or (cust.get("metadata") or {}).get("email")
-                if email:
-                    print(f"✅ email={email} via key query", flush=True)
-                    return email
-    except Exception as e:
-        print(f"⚠️ ?key lookup error: {e}", flush=True)
+        print(f"❌ OpenMeter request failed: {e}", flush=True)
 
     return None
 
-def send_email(to_email: str, subject: str, text: str):
-    params = {
-        "from": BASE_FROM,
-        "to": [to_email],
-        "subject": subject,
-        "text": text,
-    }
-    resend.Emails.send(params)
+
+def safe_get(d: dict, *path, default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur if cur is not None else default
+
 
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.route("/", methods=["POST"])
 def handle_openmeter():
-    body = request.get_json(force=True)
-    print("📥 Received webhook:", body, flush=True)
+    data = request.get_json(force=True)
+    print("📥 Received webhook:", data, flush=True)
 
-    event_type = body.get("type")
-    payload = body.get("data", {}) or {}   # <— REAL fields are inside data
+    event_type = data.get("type")
 
-    if event_type == "notification.test":
-        print(f"🧪 Test event → emailing {FALLBACK_TO}", flush=True)
-        send_email(FALLBACK_TO, "✅ OpenMeter Test Email", "This is a test email from OpenMeter.")
+    # We only react to balance thresholds (your rules fire these)
+    if event_type != "entitlements.balance.threshold":
+        print(f"⚪ Ignored event type: {event_type}", flush=True)
         return "", 200
 
-    if event_type == "entitlements.balance.threshold":
-        # Extract robustly from payload
-        subject_obj = payload.get("subject", {}) or {}
-        subject_key = subject_obj.get("key") or subject_obj.get("id")  # either is fine
+    # Pull fields we care about
+    subject_key = safe_get(data, "data", "subject", "key")
+    meter_name  = safe_get(data, "data", "feature", "name", default="Your meter")
+    meter_slug  = safe_get(data, "data", "meterSlug", default=None)
+    threshold_v = safe_get(data, "data", "threshold", "value", default=None)
+    threshold_t = safe_get(data, "data", "threshold", "type",  default="PERCENT")
 
-        feature_name = (payload.get("feature") or {}).get("name") or "Unknown Feature"
-        meter_slug   = payload.get("meterSlug") or (payload.get("meter") or {}).get("slug") or "Unknown meter"
-        threshold    = (payload.get("threshold") or {}).get("value")
+    # If meterSlug is present use that (short name), else use feature.name (nice name)
+    meter_label = meter_slug or meter_name or "meter"
 
-        print(f"🔧 Parsed → subject_key={subject_key}, feature={feature_name}, meter={meter_slug}, threshold={threshold}", flush=True)
+    # Threshold percent (formatted)
+    if threshold_t == "PERCENT" and isinstance(threshold_v, (int, float)):
+        threshold_str = f"{int(threshold_v)}%"
+    else:
+        threshold_str = str(threshold_v) if threshold_v is not None else "?"
 
-        # Find recipient email
-        to_email = find_customer_email(subject_key) or FALLBACK_TO
-        if to_email == FALLBACK_TO:
-            print(f"↩️ Using fallback email {FALLBACK_TO}", flush=True)
+    print(
+        f"🔔 Threshold fired: feature='{meter_name}', meter='{meter_label}', "
+        f"threshold={threshold_str}, subject_key='{subject_key}'",
+        flush=True,
+    )
 
-        # Nice subject/body
-        t_display = f"{threshold}%" if threshold is not None else "some"
-        subject_line = f"📊 You’ve reached {t_display} of your {meter_slug} quota"
-        body_text = (
-            f"Hello,\n\n"
-            f"Your usage for “{feature_name}” ({meter_slug}) has reached {t_display}.\n"
-            f"If you need more capacity, please consider upgrading.\n\n"
-            f"– The Nabrah Team"
-        )
+    # Look up recipient by *customer key* derived from subject key (remove dashes)
+    to_email = get_customer_email_from_subject(subject_key)
+    if not to_email:
+        to_email = FALLBACK_EMAIL
+        print(f"📩 Using fallback email {to_email} (no customer email found).", flush=True)
 
-        print(f"✉️  Sending → to={to_email} | subject={subject_line}", flush=True)
-        try:
-            send_email(to_email, subject_line, body_text)
-            print("✅ Alert email sent.", flush=True)
-        except Exception as e:
-            print("❌ Failed to send alert email:", e, flush=True)
+    # Build the email
+    subject = f"📈 You’ve reached {threshold_str} of your {meter_label} quota"
+    text = (
+        f"Hello,\n\n"
+        f"You’ve reached {threshold_str} of your {meter_label} quota.\n"
+        f"Consider upgrading for more capacity.\n\n"
+        f"– The Nabrah Team"
+    )
 
-        return "", 200
+    try:
+        resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to":   [to_email],
+            "subject": subject,
+            "text":    text,
+        })
+        print(f"✅ Alert email sent to {to_email} | subject=“{subject}”", flush=True)
+    except Exception as e:
+        print(f"❌ Failed to send alert email: {e}", flush=True)
 
-    print("ℹ️ Ignored event type:", event_type, flush=True)
     return "", 200
 
 
 if __name__ == "__main__":
+    # Local run
     app.run(host="0.0.0.0", port=5000)
